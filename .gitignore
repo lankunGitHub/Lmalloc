@@ -1,0 +1,24 @@
+# 编译产物
+*.o
+*.a
+*.so
+*.so.*
+
+# 测试二进制
+tests/test_main
+tests/check
+tests/signal_test
+
+# 运行时导出的统计/调试文件
+*.csv
+*.dot
+profile_*.json
+heapdump_*.json
+pac_blocks.csv
+slab_region_stats.csv
+bin_slab_migrate_stats.csv
+arena_extent_tree.dot
+
+# 编辑器
+*.swp
+*~

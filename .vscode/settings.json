@@ -1,0 +1,18 @@
+{
+    "files.associations": {
+        "list": "c",
+        "tsd.h": "c",
+        "arena.h": "c",
+        "arena_struct.h": "c",
+        "lmalloc_inline.h": "c",
+        "edata.h": "c",
+        "lmalloc_stats.h": "c",
+        "base.h": "c",
+        "lmalloc_tag.h": "c",
+        "cache_bin_struct.h": "c",
+        "bin.h": "c",
+        "bin_struct.h": "c",
+        "sz.h": "c"
+    },
+    "C_Cpp.default.compilerPath": ""
+}
