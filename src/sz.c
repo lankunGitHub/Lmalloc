@@ -9,14 +9,21 @@ void sz_set_policy(sz_policy_t* policy) { g_sz_policy = policy; }
 
 size_t sz_size2index(size_t size)
 {
+    // 未初始化（sz_boot之前调用）时安全返回
+    if (!g_sz_policy)
+        return SIZE_MAX;
     return g_sz_policy->size2index(g_sz_policy->data, size);
 }
 size_t sz_index2size(size_t index)
 {
+    if (!g_sz_policy)
+        return 0;
     return g_sz_policy->index2size(g_sz_policy->data, index);
 }
 size_t sz_align(size_t size)
 {
+    if (!g_sz_policy)
+        return 1;
     return g_sz_policy->align(g_sz_policy->data, size);
 }
 void sz_adapt()

@@ -10,7 +10,7 @@ typedef enum
     SZ_POLICY_DYNAMIC,
     SZ_POLICY_ADAPTIVE
 } sz_policy_mode_t;
-extern sz_policy_mode_t g_sz_policy_mode;
+
 
 // 策略接口抽象
 
@@ -37,6 +37,11 @@ void sz_set_policy(sz_policy_t* policy);
 size_t sz_size2index(size_t size);  // 查找size对应的index
 size_t sz_index2size(size_t index); // 查找index对应的size
 size_t sz_align(size_t size);       // 查找size对应的对齐量
+
+// 运行时实际bin数量：size class表中slab可容纳的类个数。
+// 由启动时的size class初始化填充，arena/bin/tcache路径以此为准，
+// 而非编译期宏SC_NBINS（宏与表布局不一致会导致大块被路由到bin）。
+extern size_t sz_nbins;
 
 // 统一 size class 初始化入口
 void sz_boot();

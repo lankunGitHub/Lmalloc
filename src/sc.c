@@ -20,6 +20,8 @@
 size_t g_sc_size2bin[4096]; // 支持最大 4096 字节的 size class
 sc_data_t g_sc_data;
 size_t g_sc_bin2size[SC_NBINS];
+// 运行时实际bin数量（slab可容纳的大小类个数），启动时由sc_data_init填充
+size_t sz_nbins = 0;
 
 // 计算大小类对应的内存块大小
 // 参数:
@@ -100,7 +102,7 @@ static void size_classes(sc_data_t* data)
         sc->size = size;
         sc->align = (ZU(1) << lg2_base);
         sc->psz = (size % (ZU(1) << LG2_PAGE) == 0);
-        if (size < (ZU(1) << (LG2_PAGE + SC_NGROUP)))
+        if (size < (ZU(1) << (LG2_PAGE + SC_LG2_NGROUP)))
         {
             sc->slab = true;
             sc->pgs = slab_size(LG2_PAGE, lg2_base, lg2_delta, ndelta);
@@ -113,12 +115,15 @@ static void size_classes(sc_data_t* data)
         if (size <= (ZU(max_lookup)))
         {
             sc->lg2_delta_lookup = lg2_delta;
-            nlbins = index + 1;
         }
         else
         {
             sc->lg2_delta_lookup = 0;
         }
+        // bin数量按slab可容纳的大小类统计（而非lookup表范围）
+        // 注意：sc->index = index++ 后index已自增，nlbins取index即为已生成条目数
+        if (sc->slab)
+            nlbins = index;
         lg2_delta = lg2_base++;
     }
 
@@ -135,7 +140,7 @@ static void size_classes(sc_data_t* data)
         size = size_compute(lg2_base, lg2_delta, ndelta);
         sc->size = size;
         sc->align = (ZU(1) << lg2_base);
-        if (size < (ZU(1) << (LG2_PAGE + SC_NGROUP)))
+        if (size < (ZU(1) << (LG2_PAGE + SC_LG2_NGROUP)))
         {
             sc->slab = true;
             sc->pgs = slab_size(LG2_PAGE, lg2_base, lg2_delta, ndelta);
@@ -161,12 +166,16 @@ static void size_classes(sc_data_t* data)
         sc_t* sc = &(data->entries[index]);
         sc->index = index++;
         sc->lg2_base = lg2_base;
-        sc->ndelta = ndelta++;
+        // lg2_delta必须赋值：曾缺失导致sc_ext按组参数重算size时
+        // 得到17/18/19等错误大小类（真实为32/48/64）
+        sc->lg2_delta = lg2_delta;
+        sc->ndelta = ndelta;
         size = size_compute(lg2_base, lg2_delta, ndelta);
+        ++ndelta;
         sc->size = size;
         sc->align = (ZU(1) << lg2_base);
         sc->psz = (size % (ZU(1) << LG2_PAGE) == 0);
-        if (size < (ZU(1) << (LG2_PAGE + SC_NGROUP)))
+        if (size < (ZU(1) << (LG2_PAGE + SC_LG2_NGROUP)))
         {
             sc->slab = true;
             sc->pgs = slab_size(LG2_PAGE, lg2_base, lg2_delta, ndelta);
@@ -207,11 +216,12 @@ static void size_classes(sc_data_t* data)
             sc->index = index++;
             sc->lg2_base = lg2_base;
             sc->lg2_delta = lg2_delta;
-            sc->ndelta = ndelta++;
+            sc->ndelta = ndelta;
             size = size_compute(lg2_base, lg2_delta, ndelta);
+            ++ndelta;
             sc->size = size;
             sc->align = (ZU(1) << lg2_base);
-            if (size < (ZU(1) << (LG2_PAGE + SC_NGROUP)))
+            if (size < (ZU(1) << (LG2_PAGE + SC_LG2_NGROUP)))
             {
                 sc->slab = true;
                 sc->pgs = slab_size(LG2_PAGE, lg2_base, lg2_delta, ndelta);
@@ -224,12 +234,15 @@ static void size_classes(sc_data_t* data)
             if (size <= (ZU(max_lookup)))
             {
                 sc->lg2_delta_lookup = lg2_delta;
-                nlbins = index + 1;
             }
             else
             {
                 sc->lg2_delta_lookup = 0;
             }
+            // bin数量按slab可容纳的大小类统计（而非lookup表范围）
+            // 注意：sc->index = index++ 后index已自增，nlbins取index即为已生成条目数
+            if (sc->slab)
+                nlbins = index;
         }
         ++lg2_base;
         ++lg2_delta;
@@ -254,7 +267,6 @@ void sc_data_init(sc_data_t* data)
     data->ntiny = SC_NTINY;
     data->nsizes = SC_NSIZES;
     data->npsizes = SC_NPSIZES;
-    data->nbins = SC_NBINS;
     data->lg2_tiny_maxclass = SC_LG2_TINY_MAX;
     data->lg2_tiny_minclass = SC_LG2_TINY_MIN;
     data->lookup_maxclass = SC_LOOKUP_MAXCLASS;
@@ -263,6 +275,11 @@ void sc_data_init(sc_data_t* data)
     data->large_maxclass = SC_LARGE_MAXCLASS;
 
     size_classes(data);
+
+    // bin数量由表内slab可容纳的大小类决定，而非编译期宏：
+    // 大小类超过slab容量的类必须走extent大块路径
+    data->nbins = data->nlbins;
+    sz_nbins = (size_t)data->nlbins;
 
     data->initialized = true;
 }

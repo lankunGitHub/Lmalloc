@@ -168,6 +168,9 @@ size_t sc_ext_data_index2size(const sc_ext_data_t* data, size_t index)
 size_t sc_ext_data_align(const sc_ext_data_t* data, size_t size)
 {
     size_t idx = sc_ext_data_find(data, size);
+    // find未命中返回SIZE_MAX，直接当数组下标会越界读
+    if (idx == SIZE_MAX || idx >= data->used)
+        return QUANTUM;
     return data->entries[idx].align;
 }
 void sc_ext_data_adapt(sc_ext_data_t* data)
