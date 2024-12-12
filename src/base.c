@@ -13,6 +13,7 @@
  */
 
 #include "base.h"
+#include "edata.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,10 +32,8 @@
 
 static size_t page_size()
 {
-    static size_t ps = 0;
-    if (ps == 0)
-        ps = sysconf(_SC_PAGESIZE);
-    return ps;
+    // 直接查询，避免静态缓存在多线程首次并发时产生数据竞争
+    return (size_t)sysconf(_SC_PAGESIZE);
 }
 
 static size_t alignment_ceil(size_t size, size_t align)
@@ -60,8 +59,10 @@ static void* mmap_backend_alloc(size_t size,
         return NULL;
     uintptr_t addr = (uintptr_t)mem;
     uintptr_t aligned = (addr + 16 + alignment - 1) & ~(alignment - 1);
-    // 记录真实映射起始地址于对齐地址之前，便于 dealloc
-    void** saved = (void**)aligned - 1;
+    // 记录真实映射起始地址于对齐地址之前，便于 dealloc。
+    // 注意必须整体位于返回地址之前（-2），否则saved[1]会写到
+    // 返回地址本身，被block头部覆盖后munmap长度错误
+    void** saved = (void**)aligned - 2;
     saved[0] = mem;
     saved[1] = (void*)total;
     return (void*)aligned;
@@ -73,7 +74,7 @@ static void mmap_backend_dealloc(void* ptr, size_t size, void* arg)
     (void)arg;
     if (!ptr)
         return;
-    void** saved = (void**)ptr - 1;
+    void** saved = (void**)ptr - 2;
     munmap(saved[0], (size_t)saved[1]);
 }
 
@@ -113,7 +114,9 @@ static base_block_t* base_block_create(base_backend_t* backend,
 
 static void base_block_destroy(base_t* base, base_block_t* block)
 {
-    base->backend->dealloc(block, block->size, base->backend->arg);
+    // backend可能为NULL（base_new/base_global默认路径），回退默认mmap后端
+    base_backend_t* backend = base->backend ? base->backend : &default_mmap_backend;
+    backend->dealloc(block, block->size, backend->arg);
 }
 
 // ------------------ trace/profile 钩子 ------------------
@@ -242,8 +245,8 @@ void* base_realloc(void* ptr, size_t old_size, size_t new_size)
 
 void* base_alloc_edata(base_t* base)
 {
-    // 直接分配一块 edata 大小的内存
-    return base_alloc(base, sizeof(void*) * 8, 64);
+    // 按实际edata结构大小分配（曾按64字节分配，写入edata字段会越界）
+    return base_alloc(base, sizeof(edata_t), 64);
 }
 void* base_alloc_rtree(base_t* base, size_t size)
 {
@@ -308,7 +311,11 @@ void base_delete(base_t* base)
 {
     if (!base)
         return;
+    // base_t 结构体本身位于首个 block 内，必须先销毁mutex再释放block，
+    // 否则会对已解除映射的内存解锁/销毁
     malloc_mutex_lock(NULL, &base->mutex);
+    malloc_mutex_unlock(NULL, &base->mutex);
+    malloc_mutex_destroy(&base->mutex);
     base_block_t* blk = base->blocks;
     while (blk)
     {
@@ -316,9 +323,6 @@ void base_delete(base_t* base)
         base_block_destroy(base, blk);
         blk = next;
     }
-    malloc_mutex_unlock(NULL, &base->mutex);
-    malloc_mutex_destroy(&base->mutex);
-    // base 结构体本身位于其首个 block 内，随 block 一并销毁
 }
 
 // ------------------ fork 支持 ------------------
