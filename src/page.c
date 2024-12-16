@@ -75,12 +75,15 @@ void pages_unmap(void* addr, size_t size)
 
 bool pages_commit(void* addr, size_t size)
 {
-    return madvise(addr, size, MADV_WILLNEED) == 0;
+    // pages_map(commit=false)以PROT_NONE映射，commit必须恢复访问权限；
+    // MADV_WILLNEED只是预读提示，无法解除PROT_NONE，曾导致首次访问SIGSEGV
+    return mprotect(addr, size, PROT_READ | PROT_WRITE) == 0;
 }
 
 bool pages_decommit(void* addr, size_t size)
 {
-    return madvise(addr, size, MADV_DONTNEED) == 0;
+    // 与commit对应：撤销访问权限（页面内容保持，再次commit可恢复）
+    return mprotect(addr, size, PROT_NONE) == 0;
 }
 
 bool pages_purge_lazy(void* addr, size_t size)
