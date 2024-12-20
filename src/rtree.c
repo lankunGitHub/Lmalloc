@@ -79,7 +79,10 @@ bool rtree_insert(rtree_t* rtree, uintptr_t addr, void* bits)
     rtree_node_t* node = (rtree_node_t*)atomic_load(&rtree->root[idx1].child);
     if (!node)
     {
-        node = (rtree_node_t*)base_calloc(1, sizeof(rtree_node_t));
+        // 二级数组需容纳 2^(UBIT/2) 个槽位（idx2掩码范围），
+        // 曾只分配1个槽位，rtree_insert首次即越界写
+        node = (rtree_node_t*)base_calloc(
+            1, sizeof(rtree_node_t) * (1U << (UBIT / 2)));
         atomic_store(&rtree->root[idx1].child, (void*)node);
     }
     atomic_store(&((rtree_leaf_t*)node)[idx2].bits, (void*)bits);
