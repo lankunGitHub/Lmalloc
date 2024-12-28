@@ -100,7 +100,10 @@ static slab_t* slab_new_arena(bin_t* bin)
     memset(slab, 0, sizeof(slab_t));
     slab->nused = 0;
     slab->edata.nregions = nregions;
-    ql_elm_new(slab, link);
+    // link字段置空：slab链表采用线性（NULL结尾）语义，
+    // 不能用ql_elm_new（其自环语义会导致线性遍历死循环）
+    slab->link.qre_next = NULL;
+    slab->link.qre_prev = NULL;
     // region辅助元数据数组
     slab->edata.region_aux_arr = (region_aux_meta_t*)base_calloc(
         nregions, sizeof(region_aux_meta_t));
@@ -116,6 +119,9 @@ void bin_init(bin_t* bin, size_t reg_size)
 {
     bin->reg_size = reg_size;
     bin->nregions = SLAB_DATA_SIZE / reg_size;
+    // bin只应管理slab可容纳的大小类（nregions>=1），
+    // 更大的类必须走extent大块路径
+    assert(bin->nregions >= 1);
     bin->slabcur = (edata_t*)slab_new_arena(bin);
     bin->unfull_slabs = NULL;
     ql_new(&bin->full_slabs);
@@ -123,6 +129,9 @@ void bin_init(bin_t* bin, size_t reg_size)
 
 /**
  * @brief 判断slab是否在full_slabs链表中
+ *
+ * 注意：full_slabs是线性（NULL结尾）链表，所有遍历/增删必须配套，
+ * 不得混用ql.h的环状语义宏（环状遍历永远不会走到NULL）。
  */
 static bool bin_full_contains(bin_t* bin, slab_t* target)
 {
@@ -134,6 +143,36 @@ static bool bin_full_contains(bin_t* bin, slab_t* target)
         s = s->link.qre_next;
     }
     return false;
+}
+
+/**
+ * @brief 追加slab到full_slabs链表尾部（线性语义）
+ */
+static void bin_full_append(bin_t* bin, slab_t* slab)
+{
+    slab_t** pp = (slab_t**)&bin->full_slabs.qlh_first;
+    while (*pp)
+        pp = (slab_t**)&(*pp)->link.qre_next;
+    *pp = slab;
+    slab->link.qre_next = NULL;
+}
+
+/**
+ * @brief 从full_slabs链表摘除slab（线性语义，不存在则不做任何事）
+ */
+static void bin_full_remove(bin_t* bin, slab_t* slab)
+{
+    slab_t** pp = (slab_t**)&bin->full_slabs.qlh_first;
+    while (*pp)
+    {
+        if (*pp == slab)
+        {
+            *pp = slab->link.qre_next;
+            slab->link.qre_next = NULL;
+            return;
+        }
+        pp = (slab_t**)&(*pp)->link.qre_next;
+    }
 }
 
 /**
@@ -191,7 +230,7 @@ void* bin_malloc_region(bin_t* bin)
     {
         // 当前slab已满，挂到full_slabs，切换新slab重试一次
         if (!bin_full_contains(bin, slab))
-            ql_tail_insert(&bin->full_slabs, slab, link);
+            bin_full_append(bin, slab);
         slab = bin_pick_slab(bin);
         idx = region_find_free(slab, bin->nregions);
         if (idx >= bin->nregions)
@@ -202,7 +241,7 @@ void* bin_malloc_region(bin_t* bin)
     if (slab->nused == bin->nregions && !bin_full_contains(bin, slab))
     {
         // slabcur变满，登记到full_slabs
-        ql_tail_insert(&bin->full_slabs, slab, link);
+        bin_full_append(bin, slab);
     }
     region_aux_meta_t* meta = &slab->edata.region_aux_arr[idx];
     meta->type = 1; // bin分配
@@ -242,7 +281,7 @@ void bin_dalloc_region(bin_t* bin, void* ptr)
     {
         // 从full/unfull链表摘除后回收整块slab
         if (bin_full_contains(bin, slab))
-            ql_remove(&bin->full_slabs, slab, link);
+            bin_full_remove(bin, slab);
         bin_unfull_remove(bin, slab);
         arena_free_extent(bin->arena, slab, sizeof(slab_t));
         if (bin->slabcur == (edata_t*)slab)
@@ -258,7 +297,7 @@ void bin_dalloc_region(bin_t* bin, void* ptr)
         {
             // 从full变unfull：移出full_slabs，挂到unfull链表
             if (bin_full_contains(bin, slab))
-                ql_remove(&bin->full_slabs, slab, link);
+                bin_full_remove(bin, slab);
             bin_unfull_remove(bin, slab);
             slab->link.qre_next = (slab_t*)bin->unfull_slabs;
             bin->unfull_slabs = slab;
@@ -421,14 +460,18 @@ void bin_slab_migrate_stats_export_csv(const char* filename)
             slab = (slab_t*)bin->full_slabs.qlh_first;
             while (slab)
             {
-                fprintf(f,
-                        "%u,%u,%p,%zu,%zu,%zu\n",
-                        a,
-                        b,
-                        slab,
-                        slab->migrate_count,
-                        slab->compact_count,
-                        slab->split_count);
+                // slabcur可能同时位于full_slabs中，避免重复导出
+                if (slab != (slab_t*)bin->slabcur)
+                {
+                    fprintf(f,
+                            "%u,%u,%p,%zu,%zu,%zu\n",
+                            a,
+                            b,
+                            slab,
+                            slab->migrate_count,
+                            slab->compact_count,
+                            slab->split_count);
+                }
                 slab = slab->link.qre_next;
             }
         }
@@ -454,17 +497,28 @@ void bin_stats_get(bin_t* bin, bin_stats_t* out)
     out->compact_count = bin->compact_count;
     out->split_count = bin->split_count;
     // 统计slab数量与region使用情况
-    slab_t* slabs[3] = {(slab_t*)bin->slabcur,
-                        (slab_t*)bin->unfull_slabs,
-                        (slab_t*)bin->full_slabs.qlh_first};
-    for (int s = 0; s < 3; ++s)
+    // 注意：slabcur是单块slab（可能同时位于full_slabs中），
+    // unfull/full链表为线性链表，遍历时需跳过slabcur避免重复计数。
+    slab_t* cur = (slab_t*)bin->slabcur;
+    if (cur)
     {
-        slab_t* slab = slabs[s];
+        out->slab_count++;
+        out->nused += cur->nused;
+        out->nregions += cur->edata.nregions;
+    }
+    slab_t* lists[2] = {(slab_t*)bin->unfull_slabs,
+                        (slab_t*)bin->full_slabs.qlh_first};
+    for (int s = 0; s < 2; ++s)
+    {
+        slab_t* slab = lists[s];
         while (slab)
         {
-            out->slab_count++;
-            out->nused += slab->nused;
-            out->nregions += slab->edata.nregions;
+            if (slab != cur)
+            {
+                out->slab_count++;
+                out->nused += slab->nused;
+                out->nregions += slab->edata.nregions;
+            }
             slab = slab->link.qre_next;
         }
     }
