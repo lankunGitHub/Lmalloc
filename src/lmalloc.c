@@ -87,7 +87,7 @@ static lmalloc_hooks_t g_lmalloc_hooks = {0};
 #define LMAGIC_ALIGNED 0x0BADF00Du
 
 // 恢复用户指针对应的真实块头部（兼容lmemalign返回的对齐指针）
-static lmalloc_hdr_t* hdr_of(void* ptr)
+lmalloc_hdr_t* hdr_of(void* ptr)
 {
     if (*(uint32_t*)((char*)ptr - 24) == LMAGIC_ALIGNED)
     {
@@ -144,6 +144,8 @@ void* lmalloc(size_t size)
         return NULL;
     if (!malloc_initialized())
         malloc_init();
+    // 处理调试信号请求的堆dump（信号处理器只置标志，此处安全执行）
+    lmalloc_debug_signal_poll();
     if (g_lmalloc_hooks.alloc)
         return g_lmalloc_hooks.alloc(size, NULL);
     size_t total = sizeof(lmalloc_hdr_t) + size + LMAGIC_TAIL_SIZE;
@@ -159,6 +161,8 @@ void* lmalloc(size_t size)
     hdr->magic = LMAGIC_ALLOC;
     hdr->tag = NULL;
     hdr->is_aligned = 0;
+    hdr->pac_base = NULL;
+    hdr->pac_size = 0;
     memset(hdr->head_guard, LMAGIC_PAD, LMAGIC_HEAD_SIZE);
     void* user_ptr = (void*)(hdr + 1);
     memset(user_ptr, 0, size);
@@ -166,7 +170,7 @@ void* lmalloc(size_t size)
     memset(tail, LMAGIC_TAIL, LMAGIC_TAIL_SIZE);
     LMALLOC_LOG("[lmalloc] alloc %p size %zu\n", user_ptr, size);
     // 分配追踪
-    if (g_trace_enabled)
+    if (g_profile_enabled)
     {
         void* callstack[LMALLOC_CALLSTACK_DEPTH] = {0};
         int cs_depth = backtrace(callstack, LMALLOC_CALLSTACK_DEPTH);
@@ -220,7 +224,10 @@ void* lmalloc_tagged(size_t size, const char* tag)
         malloc_init();
     if (g_lmalloc_hooks.alloc)
         return g_lmalloc_hooks.alloc(size, tag);
-    size_t total = size + sizeof(lmalloc_hdr_t) + sizeof(uint32_t);
+    // 尾部保护区与lmalloc一致（LMAGIC_TAIL_SIZE字节）：
+    // 曾只预留sizeof(uint32_t)且未初始化head_guard，导致lfree按16字节
+    // 校验误报溢出，且大小类错配（同块按两个大小类分配/释放会写坏相邻块）
+    size_t total = size + sizeof(lmalloc_hdr_t) + LMAGIC_TAIL_SIZE;
     void* raw = NULL;
     if (!malloc_fastpath(total, &raw))
         raw = malloc_default(total);
@@ -231,10 +238,13 @@ void* lmalloc_tagged(size_t size, const char* tag)
     hdr->magic = LMAGIC_ALLOC;
     hdr->tag = tag;
     hdr->is_aligned = 0;
+    hdr->pac_base = NULL;
+    hdr->pac_size = 0;
+    memset(hdr->head_guard, LMAGIC_PAD, LMAGIC_HEAD_SIZE);
     void* user_ptr = (void*)(hdr + 1);
     memset(user_ptr, 0xAA, size);
-    uint32_t* tail = (uint32_t*)((char*)user_ptr + size);
-    *tail = LMAGIC_TAIL;
+    uint8_t* tail = (uint8_t*)user_ptr + size;
+    memset(tail, LMAGIC_TAIL, LMAGIC_TAIL_SIZE);
     LMALLOC_LOG("[lmalloc] alloc(tag) %p size %zu tag=%s\n",
                 user_ptr,
                 size,
@@ -246,14 +256,10 @@ void* lmalloc_tagged(size_t size, const char* tag)
         user_ptr, size, 1, (uint32_t)pthread_self(), time(NULL), tag, {0}, 0};
     memcpy(e.callstack, callstack, sizeof(void*) * cs_depth);
     e.callstack_depth = cs_depth;
-    if (g_trace_enabled)
+    if (g_profile_enabled)
         lmalloc_profile_log_event(&e);
-    // 标签统计
-    if (g_tag_enabled)
-    {
-        lmalloc_tag_stat_t dummy;
-        lmalloc_tag_stats(tag, &dummy); // 确保标签存在
-    }
+    // 标签统计：主路径记账（alloc_count/current_bytes/peak_bytes）
+    lmalloc_tag_account_alloc(tag, size);
     // 泄漏检测注册
     if (g_leak_enabled)
     {
@@ -327,21 +333,16 @@ void lfree(void* ptr)
         ptr, size, 0, (uint32_t)pthread_self(), time(NULL), hdr->tag, {0}, 0};
     memcpy(e.callstack, callstack, sizeof(void*) * cs_depth);
     e.callstack_depth = cs_depth;
-    if (g_trace_enabled)
+    if (g_profile_enabled)
         lmalloc_profile_log_event(&e);
-    // 标签统计
-    if (hdr->tag)
-    {
-        if (g_tag_enabled)
-        {
-            lmalloc_tag_stat_t dummy;
-            lmalloc_tag_stats(hdr->tag, &dummy);
-        }
-    }
+    // 标签统计：主路径记账（free_count/current_bytes回退）
+    lmalloc_tag_account_free(hdr->tag, size);
     // 泄漏检测注销
     if (g_leak_enabled)
     {
-        leak_unregister(ptr);
+        // 用头部对应的用户指针注销：lmemalign返回的对齐指针与注册时
+        // 的内层指针不同，用传入指针会永远匹配不上（表项残留）
+        leak_unregister((void*)(hdr + 1));
     }
     if (g_stats_enabled)
     {
@@ -349,6 +350,13 @@ void lfree(void* ptr)
         atomic_fetch_sub(&g_lmalloc_stats.current_bytes, size);
     }
     tsd_t* tsd = tsd_get(false);
+    // pac大块路径：按hdr记录的映射基址整段munmap，与大小类无关
+    // （lmemalign高对齐小块的大小类可能落在bin范围内，不能按大小类路由）
+    if (hdr->pac_base)
+    {
+        pac_dalloc(tsd, hdr->pac_base, hdr->pac_size);
+        return;
+    }
     // 按整块大小（头部+用户区+尾部保护区）计算size class
     size_t total = sizeof(lmalloc_hdr_t) + size + LMAGIC_TAIL_SIZE;
     szind_t ind = sz_size2index(total);
@@ -425,9 +433,49 @@ void* lrealloc(void* ptr, size_t size)
  */
 void* lmemalign(size_t alignment, size_t size)
 {
+    if (size == 0)
+        return NULL;
     if (size > (1 << 20) || alignment > 4096)
     {
-        return pac_alloc(NULL, size, alignment);
+        // pac大块/高对齐路径：在用户指针前放置标准头部，
+        // hdr->pac_base/pac_size记录映射基址和长度，lfree按常规流程回收。
+        // 曾直接返回裸指针，导致lfree报corruption且永不munmap。
+        if (!malloc_initialized())
+            malloc_init();
+        size_t total = sizeof(lmalloc_hdr_t) + size + LMAGIC_TAIL_SIZE;
+        tsd_t* tsd = tsd_get(true);
+        void* raw = pac_alloc(tsd, total + alignment, alignment);
+        if (!raw)
+            return NULL;
+        uintptr_t user_addr =
+            ((uintptr_t)raw + sizeof(lmalloc_hdr_t) + alignment - 1) &
+            ~(alignment - 1);
+        lmalloc_hdr_t* hdr =
+            (lmalloc_hdr_t*)(user_addr - sizeof(lmalloc_hdr_t));
+        hdr->size = size;
+        hdr->magic = LMAGIC_ALLOC;
+        hdr->tag = NULL;
+        hdr->is_aligned = 0;
+        hdr->pac_base = raw;
+        hdr->pac_size = total + alignment;
+        memset(hdr->head_guard, LMAGIC_PAD, LMAGIC_HEAD_SIZE);
+        uint8_t* user = (uint8_t*)user_addr;
+        memset(user, 0, size);
+        uint8_t* tail = user + size;
+        memset(tail, LMAGIC_TAIL, LMAGIC_TAIL_SIZE);
+        // 统计与泄漏检测注册（与lmalloc保持一致）
+        if (g_leak_enabled)
+            leak_register(user, size, NULL, (uint32_t)pthread_self());
+        if (g_stats_enabled)
+        {
+            atomic_fetch_add(&g_lmalloc_stats.alloc_count, 1);
+            atomic_fetch_add(&g_lmalloc_stats.current_bytes, size);
+            size_t cur = atomic_load(&g_lmalloc_stats.current_bytes);
+            size_t peak = atomic_load(&g_lmalloc_stats.peak_bytes);
+            if (cur > peak)
+                atomic_store(&g_lmalloc_stats.peak_bytes, cur);
+        }
+        return (void*)user_addr;
     }
     // 多分配 alignment+24 空间用于对齐调整和恢复信息
     void* p = lmalloc(size + alignment + 24);

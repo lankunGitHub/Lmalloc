@@ -31,6 +31,10 @@ typedef struct lmalloc_hdr_s
     const char* tag;                      // 分配标签
     uint8_t is_aligned;                   // 是否lmemalign调整过的对齐指针
     uint8_t head_guard[LMAGIC_HEAD_SIZE]; // 头部保护区
+    // pac大块路径专用：记录映射基址和长度，供lfree整段munmap。
+    // 普通路径恒为NULL/0（映射基址即hdr本身）
+    void* pac_base;
+    size_t pac_size;
 } lmalloc_hdr_t;
 
 // 全局初始化标志和互斥锁
@@ -89,7 +93,7 @@ static inline bool malloc_fastpath(size_t size, void** ret)
     }
     // 计算 size class index（用sz接口）
     size_t ind = sz_size2index(size);
-    if (ind == SIZE_MAX || ind >= SC_NBINS)
+    if (ind == SIZE_MAX || ind >= sz_nbins)
         return false;
     *ret = tcache_alloc(tsd, size, ind);
     return *ret != NULL;
@@ -112,13 +116,16 @@ static inline void* malloc_default(size_t size)
         return pac_alloc(tsd, size, 16);
     }
     arena_t* arena = arena_choose(tsd);
-    if (ind < SC_NBINS)
+    if (ind < sz_nbins)
     {
         return arena_malloc_small(arena, ind);
     }
     // 超过bin范围的大块走extent红黑树路径
     return arena_malloc_large(arena, size);
 }
+
+// 由用户指针对应的真实块头部（兼容lmemalign返回的对齐指针）
+lmalloc_hdr_t* hdr_of(void* ptr);
 
 // 统计打印接口（只声明）
 void lmalloc_stats_print(void);

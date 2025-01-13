@@ -109,6 +109,15 @@ void* lmemalign(size_t alignment, size_t size);
 void* lmalloc_tag(size_t size, const char* tag);
 
 /**
+ * @brief 分配带标签的内存（同lmalloc_tag，命名与文档一致）。
+ * @param size 字节数
+ * @param tag 标签字符串
+ * @return 分配成功返回指针，失败返回NULL
+ * @note 线程安全。
+ */
+void* lmalloc_tagged(size_t size, const char* tag);
+
+/**
  * @brief 释放由lmalloc_tagged分配的内存。
  * @param ptr 待释放指针
  * @note 线程安全。
