@@ -40,6 +40,7 @@
 #include "arena.h"
 #include "bin.h"
 #include "sc.h"
+#include "sz.h"
 #include <assert.h>
 #include <sched.h>
 #include <stddef.h>
@@ -62,9 +63,8 @@
 
 // 全局arena列表及并发管理
 #define MAX_ARENAS 64
-arena_t* arenas[MAX_ARENAS];       // 所有arena实例
-unsigned n_arenas = 0;             // 当前arena数量
-static atomic_uint next_arena = 0; // 用于分配新线程arena的原子计数
+arena_t* arenas[MAX_ARENAS]; // 所有arena实例
+unsigned n_arenas = 0;       // 当前arena数量
 struct numa_stats_s g_numa_stats = {0};
 
 /**
@@ -142,28 +142,26 @@ arena_t* arena_choose(tsd_t* tsd)
 arena_t* arena_new(unsigned arena_id)
 {
     // 用全局base分配arena_t结构体
-    arena_t* arena = (arena_t*)base_alloc(
-        TSDN_NULL, get_global_base(), sizeof(arena_t), QUANTUM);
+    arena_t* arena = (arena_t*)base_alloc(base_global(), sizeof(arena_t), QUANTUM);
     if (!arena)
         return NULL;
     memset(arena, 0, sizeof(arena_t));
     // 每个arena有自己的base
-    arena->base = base_new(TSDN_NULL, arena_id);
+    arena->base = base_new(arena_id, NULL, -1);
     if (!arena->base)
     {
-        free(arena);
         return NULL;
     }
     arena->n_bins = SC_NBINS;
-    arena->bins = (bin_t*)base_alloc(
-        TSDN_NULL, arena->base, SC_NBINS * sizeof(bin_t), QUANTUM);
+    arena->bins = (bin_t*)base_alloc(arena->base, SC_NBINS * sizeof(bin_t), QUANTUM);
     if (arena->bins)
         memset(arena->bins, 0, SC_NBINS * sizeof(bin_t));
     for (unsigned i = 0; i < arena->n_bins; ++i)
     {
         bin_t* bin = &arena->bins[i];
         bin->arena = arena;
-        bin_init(bin);
+        // 每个bin按自身size class切分region
+        bin_init(bin, sz_index2size(i));
     }
     arena->arena_id = arena_id;
     arena->n_threads = 0;
@@ -237,7 +235,7 @@ void arena_dalloc_small(arena_t* arena, void* ptr, szind_t ind)
  *   - 按地址有序插入，若与前/后块相邻则合并
  *   - 合并后释放多余节点
  */
-static void arena_insert_extent_merge(arena_t* arena, void* addr, size_t size)
+void arena_insert_extent_merge(arena_t* arena, void* addr, size_t size)
 {
     extent_node_t** prev = &arena->extent_free_list;
     extent_node_t* node = arena->extent_free_list;
@@ -271,8 +269,8 @@ static void arena_insert_extent_merge(arena_t* arena, void* addr, size_t size)
         return;
     }
     // 插入新节点
-    extent_node_t* new_node = (extent_node_t*)arena->base->alloc(
-        tsd_get(), tsd_get()->base, sizeof(extent_node_t), QUANTUM);
+    extent_node_t* new_node = (extent_node_t*)base_alloc(
+        arena->base, sizeof(extent_node_t), QUANTUM);
     new_node->addr = addr;
     new_node->size = size;
     new_node->next = node;
@@ -429,18 +427,6 @@ static void extent_tree_insert(extent_node_t** root, extent_node_t* node)
     node->left = node->right = NULL;
     node->color = EXTENT_RB_RED;
     extent_rbtree_insert_fixup(root, node);
-}
-
-/**
- * @brief 红黑树最小节点
- * @param node 根节点
- * @return 最小节点指针
- */
-static extent_node_t* extent_tree_min(extent_node_t* node)
-{
-    while (node && node->left)
-        node = node->left;
-    return node;
 }
 
 /**
@@ -695,7 +681,7 @@ static void* arena_alloc_extent_tree(arena_t* arena, size_t size)
 {
     extent_node_t* node = extent_tree_best_fit(arena->extent_tree_root, size);
     if (!node)
-        return arena->base->alloc(tsd_get(), tsd_get()->base, size, QUANTUM);
+        return base_alloc(arena->base, size, QUANTUM);
     // 分割或整块分配
     void* addr = node->addr;
     if (node->size == size)
@@ -758,8 +744,8 @@ static void arena_free_extent_tree(arena_t* arena, void* addr, size_t size)
         // extent_node_t等元数据回收时，直接插入extent_free_list或空闲树，不做free。
     }
     // 插入新节点
-    extent_node_t* new_node = (extent_node_t*)arena->base->alloc(
-        tsd_get(), tsd_get()->base, sizeof(extent_node_t), QUANTUM);
+    extent_node_t* new_node = (extent_node_t*)base_alloc(
+        arena->base, sizeof(extent_node_t), QUANTUM);
     new_node->addr = addr;
     new_node->size = size;
     new_node->parent = new_node->left = new_node->right = new_node->prev = NULL;
@@ -791,7 +777,6 @@ void arena_extent_decay(arena_t* arena)
         {
             munmap(node->addr, node->size);
             *prev = node->next;
-            extent_node_t* tofree = node;
             node = node->next;
             // extent_node_t等元数据回收时，直接插入extent_free_list或空闲树，不做free。
             continue;
@@ -859,7 +844,9 @@ void* arena_alloc_extent_numa_ex(arena_t* arena,
     }
 #endif
     // Fallback: 普通分配
-    void* mem = arena->base->alloc(tsd_get(), tsd_get()->base, size, QUANTUM);
+    (void)node;
+    (void)use_hugepage;
+    void* mem = base_alloc(arena->base, size, QUANTUM);
     g_numa_stats.alloc_count[0]++;
     g_numa_stats.alloc_bytes[0] += size;
     return mem;
@@ -875,6 +862,7 @@ void* arena_alloc_extent_numa_ex(arena_t* arena,
  */
 void arena_free_extent_numa(void* addr, size_t size, int node, int is_hugepage)
 {
+    (void)addr;
     if (node < 0)
         node = 0;
     g_numa_stats.free_count[node]++;
@@ -884,6 +872,17 @@ void arena_free_extent_numa(void* addr, size_t size, int node, int is_hugepage)
         g_numa_stats.hugepage_count[node]++;
         g_numa_stats.hugepage_bytes[node] += size;
     }
+}
+
+/**
+ * @brief NUMA感知slab/extent分配（简化接口，不指定NUMA节点）
+ * @param arena 当前arena
+ * @param size 分配大小
+ * @return 分配到的内存指针
+ */
+void* arena_alloc_extent_numa(arena_t* arena, size_t size)
+{
+    return arena_alloc_extent_numa_ex(arena, size, -1, 0);
 }
 
 /**
@@ -904,12 +903,6 @@ void numa_stats_print(void)
     }
 #endif
 }
-
-/**
- * @brief heap dump时输出NUMA统计
- * 典型调用链：lmalloc_heap_dump -> numa_stats_print
- */
-void lmalloc_heap_dump(void) { numa_stats_print(); }
 
 /**
  * @brief extent_tree中序遍历打印
@@ -1002,8 +995,8 @@ void arena_extent_tree_debug(arena_t* arena)
 }
 
 // 后台decay回收线程参数与实现
-static int g_decay_interval_sec = 10; // 回收周期（秒）
-static int g_decay_threshold = 8;     // 超过多少个空闲extent触发回收
+int g_decay_interval_sec = 10; // 回收周期（秒），可被auto_tune调整
+int g_decay_threshold = 8;     // 超过多少个空闲extent触发回收
 static int g_decay_thread_running = 0;
 static pthread_t g_decay_thread;
 
@@ -1094,4 +1087,89 @@ void arena_dalloc_large(arena_t* arena, void* ptr, size_t size)
     else
         arena->current_bytes = 0;
     malloc_mutex_unlock(TSDN_NULL, &arena->mutex);
+}
+
+/**
+ * @brief 获取arena统计快照（遍历bin/slab实时计算）
+ * @param arena 目标arena
+ * @param out 输出统计结构体
+ */
+void arena_stats_get(arena_t* arena, arena_stats_t* out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!arena)
+        return;
+    out->alloc_count = arena->alloc_count;
+    out->free_count = arena->free_count;
+    out->current_bytes = arena->current_bytes;
+    out->peak_bytes = arena->peak_bytes;
+    out->decay_count = arena->decay_count;
+    out->migrate_count = arena->migrate_count;
+    out->compact_count = arena->compact_count;
+    out->split_count = arena->split_count;
+    out->n_threads = arena->n_threads;
+    // 遍历bin统计slab数量与使用情况
+    for (unsigned b = 0; b < arena->n_bins; ++b)
+    {
+        bin_t* bin = &arena->bins[b];
+        slab_t* slabs[3] = {(slab_t*)bin->slabcur,
+                            (slab_t*)bin->unfull_slabs,
+                            (slab_t*)bin->full_slabs.qlh_first};
+        for (int s = 0; s < 3; ++s)
+        {
+            slab_t* slab = slabs[s];
+            while (slab)
+            {
+                out->slab_count++;
+                out->slab_bytes += sizeof(slab_t);
+                slab = slab->link.qre_next;
+            }
+        }
+    }
+    // 统计空闲extent
+    extent_node_t* node = arena->extent_free_list;
+    while (node)
+    {
+        out->extent_count++;
+        out->extent_bytes += node->size;
+        node = node->next;
+    }
+}
+
+/**
+ * @brief 打印单个arena统计
+ * @param arena 目标arena
+ */
+void arena_stats_print(arena_t* arena)
+{
+    arena_stats_t s;
+    arena_stats_get(arena, &s);
+    printf("[arena %u] threads=%zu alloc=%zu free=%zu cur=%zu peak=%zu "
+           "slabs=%zu(%zuB) extents=%zu(%zuB) decay=%zu migrate=%zu "
+           "compact=%zu split=%zu\n",
+           arena->arena_id,
+           s.n_threads,
+           s.alloc_count,
+           s.free_count,
+           s.current_bytes,
+           s.peak_bytes,
+           s.slab_count,
+           s.slab_bytes,
+           s.extent_count,
+           s.extent_bytes,
+           s.decay_count,
+           s.migrate_count,
+           s.compact_count,
+           s.split_count);
+}
+
+/**
+ * @brief 打印所有arena统计
+ */
+void arena_stats_print_all(void)
+{
+    for (unsigned i = 0; i < n_arenas; ++i)
+    {
+        arena_stats_print(arenas[i]);
+    }
 }
