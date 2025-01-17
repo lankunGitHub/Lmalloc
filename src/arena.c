@@ -152,10 +152,18 @@ arena_t* arena_new(unsigned arena_id)
     {
         return NULL;
     }
-    arena->n_bins = SC_NBINS;
-    arena->bins = (bin_t*)base_alloc(arena->base, SC_NBINS * sizeof(bin_t), QUANTUM);
+    // bin数量以size class表的slab可容纳类为准（运行时值sz_nbins），
+    // 编译期宏SC_NBINS与表布局不一致会导致大块被错误路由到bin
+    // mutex必须显式初始化：曾依赖零内存凑巧等价于
+    // PTHREAD_MUTEX_INITIALIZER（非可移植，且witness检查静默跳过）
+    if (malloc_mutex_init(&arena->mutex, "arena", 0, 0))
+        return NULL;
+    arena->n_bins = sz_nbins;
+    arena->bins = (bin_t*)base_alloc(arena->base, sz_nbins * sizeof(bin_t), QUANTUM);
     if (arena->bins)
-        memset(arena->bins, 0, SC_NBINS * sizeof(bin_t));
+        memset(arena->bins, 0, sz_nbins * sizeof(bin_t));
+    else
+        return NULL; // 元数据分配失败时不得继续解引用
     for (unsigned i = 0; i < arena->n_bins; ++i)
     {
         bin_t* bin = &arena->bins[i];
@@ -183,19 +191,23 @@ void* arena_malloc_small(arena_t* arena, szind_t ind)
 {
     if (!arena || ind >= arena->n_bins)
         return NULL;
+    // 加锁：slab链表/位图/空slab回收均在arena内共享，
+    // 无锁并发会撕裂链表（bin_malloc_region内部无锁）
+    malloc_mutex_lock(TSDN_NULL, &arena->mutex);
     bin_t* bin = &arena->bins[ind];
     void* p = bin_malloc_region(bin);
     if (p)
     {
         arena->alloc_count++;
         bin->alloc_count++;
-        bin->current_bytes += bin->slabcur ? bin->slabcur->nregions : 0;
+        bin->current_bytes += bin->slabcur ? bin->reg_size : 0;
         if (bin->current_bytes > bin->peak_bytes)
             bin->peak_bytes = bin->current_bytes;
         arena->current_bytes++;
         if (arena->current_bytes > arena->peak_bytes)
             arena->peak_bytes = arena->current_bytes;
     }
+    malloc_mutex_unlock(TSDN_NULL, &arena->mutex);
     return p;
 }
 
@@ -212,6 +224,8 @@ void arena_dalloc_small(arena_t* arena, void* ptr, szind_t ind)
 {
     if (!arena || ind >= arena->n_bins)
         return;
+    // 加锁：回收可能触发空slab整块释放并合并进extent链表
+    malloc_mutex_lock(TSDN_NULL, &arena->mutex);
     bin_t* bin = &arena->bins[ind];
     bin_dalloc_region(bin, ptr);
     arena->free_count++;
@@ -220,6 +234,7 @@ void arena_dalloc_small(arena_t* arena, void* ptr, szind_t ind)
         bin->current_bytes--;
     if (arena->current_bytes > 0)
         arena->current_bytes--;
+    malloc_mutex_unlock(TSDN_NULL, &arena->mutex);
 }
 
 /**
@@ -235,13 +250,52 @@ void arena_dalloc_small(arena_t* arena, void* ptr, szind_t ind)
  *   - 按地址有序插入，若与前/后块相邻则合并
  *   - 合并后释放多余节点
  */
+// 红黑树辅助宏
+#define EXTENT_RB_BLACK 0
+#define EXTENT_RB_RED   1
+
+// 红黑树接口前置声明（extent合并逻辑在树函数定义之前使用）
+static void extent_tree_insert(extent_node_t** root, extent_node_t* node);
+void extent_tree_delete(extent_node_t** root, extent_node_t* z);
+
+// 从avail链表取extent节点（复用被合并掉的节点，避免每次alloc/free
+// 都base_alloc新节点且永不回收导致元数据单调增长）
+static extent_node_t* extent_node_alloc(arena_t* arena)
+{
+    extent_node_t* node = arena->extent_node_avail;
+    if (node)
+    {
+        arena->extent_node_avail = node->next;
+        return node;
+    }
+    return (extent_node_t*)base_alloc(
+        arena->base, sizeof(extent_node_t), QUANTUM);
+}
+
+// 回收不再使用的extent节点到avail链表
+static void extent_node_recycle(arena_t* arena, extent_node_t* node)
+{
+    node->next = arena->extent_node_avail;
+    arena->extent_node_avail = node;
+}
+
+// extent节点addr/size变化后从树中删除再重插，维持键序
+static void extent_tree_rekey(arena_t* arena, extent_node_t* node)
+{
+    extent_tree_delete(&arena->extent_tree_root, node);
+    node->parent = node->left = node->right = NULL;
+    node->color = EXTENT_RB_RED;
+    extent_tree_insert(&arena->extent_tree_root, node);
+}
+
 void arena_insert_extent_merge(arena_t* arena, void* addr, size_t size)
 {
+    size = ALIGNMENT_CEILING(size, QUANTUM);
     extent_node_t** prev = &arena->extent_free_list;
     extent_node_t* node = arena->extent_free_list;
     uintptr_t new_addr = (uintptr_t)addr;
     uintptr_t new_end = new_addr + size;
-    // 查找插入点
+    // 查找插入点（链表按地址有序）
     while (node && (uintptr_t)node->addr < new_addr)
     {
         prev = &node->next;
@@ -250,37 +304,48 @@ void arena_insert_extent_merge(arena_t* arena, void* addr, size_t size)
     // 检查与前一个合并
     if (*prev && (uintptr_t)(*prev)->addr + (*prev)->size == new_addr)
     {
-        (*prev)->size += size;
+        extent_node_t* merged = *prev;
+        extent_tree_delete(&arena->extent_tree_root, merged);
+        merged->size += size;
         // 检查与下一个合并
         if (node && new_end == (uintptr_t)node->addr)
         {
-            (*prev)->size += node->size;
-            (*prev)->next = node->next;
-            // extent_node_t等元数据回收时，直接插入extent_free_list或空闲树，不做free。
+            extent_tree_delete(&arena->extent_tree_root, node);
+            merged->size += node->size;
+            merged->next = node->next;
+            extent_node_recycle(arena, node);
         }
+        // 合并后键值变化，重插红黑树
+        merged->parent = merged->left = merged->right = NULL;
+        merged->color = EXTENT_RB_RED;
+        extent_tree_insert(&arena->extent_tree_root, merged);
         return;
     }
     // 检查与下一个合并
     if (node && new_end == (uintptr_t)node->addr)
     {
-        node->addr = addr;
+        extent_tree_delete(&arena->extent_tree_root, node);
+        node->addr = (void*)new_addr;
         node->size += size;
-        // extent_node_t等元数据回收时，直接插入extent_free_list或空闲树，不做free。
+        node->free_time = time(NULL);
+        node->parent = node->left = node->right = NULL;
+        node->color = EXTENT_RB_RED;
+        extent_tree_insert(&arena->extent_tree_root, node);
         return;
     }
-    // 插入新节点
-    extent_node_t* new_node = (extent_node_t*)base_alloc(
-        arena->base, sizeof(extent_node_t), QUANTUM);
-    new_node->addr = addr;
+    // 插入新节点：同时挂入地址有序链表和大小键红黑树
+    extent_node_t* new_node = extent_node_alloc(arena);
+    new_node->addr = (void*)new_addr;
     new_node->size = size;
     new_node->next = node;
     new_node->free_time = time(NULL);
+    new_node->parent = new_node->left = new_node->right = NULL;
+    new_node->color = EXTENT_RB_RED;
     *prev = new_node;
+    extent_tree_insert(&arena->extent_tree_root, new_node);
 }
 
 // 红黑树辅助宏和函数
-#define EXTENT_RB_BLACK 0
-#define EXTENT_RB_RED   1
 
 /**
  * @brief 红黑树左旋操作
@@ -679,6 +744,9 @@ void extent_tree_delete(extent_node_t** root, extent_node_t* z)
  */
 static void* arena_alloc_extent_tree(arena_t* arena, size_t size)
 {
+    // 分配尺寸对齐到QUANTUM，防止分割后剩余extent地址漂移，
+    // 否则连续分配会得到未对齐指针（后续hdr/用户指针均未对齐）
+    size = ALIGNMENT_CEILING(size, QUANTUM);
     extent_node_t* node = extent_tree_best_fit(arena->extent_tree_root, size);
     if (!node)
         return base_alloc(arena->base, size, QUANTUM);
@@ -686,13 +754,25 @@ static void* arena_alloc_extent_tree(arena_t* arena, size_t size)
     void* addr = node->addr;
     if (node->size == size)
     {
+        // 整块分配：从树和链表摘除后复用节点
         extent_tree_delete(&arena->extent_tree_root, node);
+        extent_node_t** pp = &arena->extent_free_list;
+        while (*pp && *pp != node)
+            pp = &(*pp)->next;
+        if (*pp == node)
+            *pp = node->next;
+        extent_node_recycle(arena, node);
         return addr;
     }
     else
     {
+        // 分割：剩余extent的addr前移、size减小，键值变化必须
+        // 从树中删除后重插（曾原地修改导致size键序失效，
+        // best-fit漏配/非最小）。链表无需调整：剩余部分地址
+        // 仍小于其后继节点
         node->addr = (char*)node->addr + size;
         node->size -= size;
+        extent_tree_rekey(arena, node);
         return addr;
     }
 }
@@ -709,49 +789,11 @@ static void* arena_alloc_extent_tree(arena_t* arena, size_t size)
  */
 static void arena_free_extent_tree(arena_t* arena, void* addr, size_t size)
 {
-    uintptr_t a = (uintptr_t)addr;
-    uintptr_t b = a + size;
-    extent_node_t* left = NULL;
-    extent_node_t* right = NULL;
-    // 查找左邻、右邻
-    extent_node_t* node = arena->extent_tree_root;
-    while (node)
-    {
-        if ((uintptr_t)node->addr + node->size == a)
-            left = node;
-        if ((uintptr_t)node->addr == b)
-            right = node;
-        if (b <= (uintptr_t)node->addr)
-            node = node->left;
-        else if (a >= (uintptr_t)node->addr + node->size)
-            node = node->right;
-        else
-            break;
-    }
-    // 合并左邻
-    if (left)
-    {
-        extent_tree_delete(&arena->extent_tree_root, left);
-        addr = left->addr;
-        size += left->size;
-        // extent_node_t等元数据回收时，直接插入extent_free_list或空闲树，不做free。
-    }
-    // 合并右邻
-    if (right)
-    {
-        extent_tree_delete(&arena->extent_tree_root, right);
-        size += right->size;
-        // extent_node_t等元数据回收时，直接插入extent_free_list或空闲树，不做free。
-    }
-    // 插入新节点
-    extent_node_t* new_node = (extent_node_t*)base_alloc(
-        arena->base, sizeof(extent_node_t), QUANTUM);
-    new_node->addr = addr;
-    new_node->size = size;
-    new_node->parent = new_node->left = new_node->right = new_node->prev = NULL;
-    new_node->color = EXTENT_RB_RED;
-    new_node->free_time = time(NULL);
-    extent_tree_insert(&arena->extent_tree_root, new_node);
+    // 回收统一走地址有序链表的合并逻辑（arena_insert_extent_merge），
+    // 链表与大小键红黑树同步维护。
+    // 曾在size键红黑树上按地址区间下降找邻居：键与地址无对应关系，
+    // 遇到首个区间重叠节点即提前终止，漏掉真正的相邻块无法合并
+    arena_insert_extent_merge(arena, addr, size);
 }
 
 /**
@@ -765,7 +807,11 @@ static void arena_free_extent_tree(arena_t* arena, void* addr, size_t size)
  */
 void arena_extent_decay(arena_t* arena)
 {
-    extent_node_t** prev = &arena->extent_free_list;
+    // 注意：extent_free_list中的地址来自arena base的2MB mmap块
+    // （bin释放的空slab）或大块分配，不能用munmap释放——
+    // 会unmap掉base仍在使用的页；改用MADV_DONTNEED丢弃内容，
+    // 后续重新分配时按零页fault-in，安全且可回收物理内存
+    malloc_mutex_lock(TSDN_NULL, &arena->mutex);
     extent_node_t* node = arena->extent_free_list;
     time_t now = time(NULL);
     int count = 0;
@@ -775,15 +821,11 @@ void arena_extent_decay(arena_t* arena)
         if (count > EXTENT_DECAY_MAX_FREE &&
             now - node->free_time > EXTENT_DECAY_INTERVAL)
         {
-            munmap(node->addr, node->size);
-            *prev = node->next;
-            node = node->next;
-            // extent_node_t等元数据回收时，直接插入extent_free_list或空闲树，不做free。
-            continue;
+            madvise(node->addr, node->size, MADV_DONTNEED);
         }
-        prev = &node->next;
         node = node->next;
     }
+    malloc_mutex_unlock(TSDN_NULL, &arena->mutex);
 }
 
 /**
@@ -1108,20 +1150,30 @@ void arena_stats_get(arena_t* arena, arena_stats_t* out)
     out->compact_count = arena->compact_count;
     out->split_count = arena->split_count;
     out->n_threads = arena->n_threads;
-    // 遍历bin统计slab数量与使用情况
+    // 遍历bin统计slab数量与使用情况。
+    // slabcur是单块slab（可能同时位于full_slabs），只计一次；
+    // unfull/full为线性链表，遍历时跳过slabcur避免重复计数。
     for (unsigned b = 0; b < arena->n_bins; ++b)
     {
         bin_t* bin = &arena->bins[b];
-        slab_t* slabs[3] = {(slab_t*)bin->slabcur,
-                            (slab_t*)bin->unfull_slabs,
-                            (slab_t*)bin->full_slabs.qlh_first};
-        for (int s = 0; s < 3; ++s)
+        slab_t* cur = (slab_t*)bin->slabcur;
+        if (cur)
         {
-            slab_t* slab = slabs[s];
+            out->slab_count++;
+            out->slab_bytes += sizeof(slab_t);
+        }
+        slab_t* lists[2] = {(slab_t*)bin->unfull_slabs,
+                            (slab_t*)bin->full_slabs.qlh_first};
+        for (int s = 0; s < 2; ++s)
+        {
+            slab_t* slab = lists[s];
             while (slab)
             {
-                out->slab_count++;
-                out->slab_bytes += sizeof(slab_t);
+                if (slab != cur)
+                {
+                    out->slab_count++;
+                    out->slab_bytes += sizeof(slab_t);
+                }
                 slab = slab->link.qre_next;
             }
         }

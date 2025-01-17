@@ -31,6 +31,7 @@ struct arena_s
     unsigned n_threads;                     // 绑定到该 arena 的线程数
     struct extent_node_s* extent_free_list; // 兼容老接口
     struct extent_node_s* extent_tree_root; // extent 红黑树根节点
+    struct extent_node_s* extent_node_avail; // 可复用的extent节点链表
     size_t alloc_count;
     size_t free_count;
     size_t current_bytes;
