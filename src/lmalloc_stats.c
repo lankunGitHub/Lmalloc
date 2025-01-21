@@ -77,7 +77,8 @@ void lmalloc_slab_region_lifetime_export_csv(const char* filename) {
                 for (size_t r = 0; r < slab->edata.nregions; ++r) {
                     region_aux_meta_t* meta = &slab->edata.region_aux_arr[r];
                     if (meta->alloc_time) {
-                        time_t free_time = meta->type == 0 ? time(NULL) : 0;
+                        // 使用记录的实际释放时间（曾用time(NULL)导致live_sec随挂钟增长）
+                        time_t free_time = meta->type == 0 ? (time_t)meta->free_time : 0;
                         long live_sec = free_time ? (free_time - meta->alloc_time) : 0;
                         fprintf(f, "%u,%u,%p,%zu,%u,%ld,%ld\n", a, b, slab, r, meta->alloc_time, free_time, live_sec);
                     }
@@ -135,6 +136,7 @@ void lmalloc_stats_export_json(const char* filename) {
     fprintf(f, "{\n  \"arenas\": [\n");
     for (unsigned a = 0; a < n_arenas; ++a) {
         arena_t* arena = arenas[a];
+        malloc_mutex_lock(TSDN_NULL, &arena->mutex);
         fprintf(f, "    {\"arena_id\":%u,\"alloc_count\":%zu,\"free_count\":%zu,\"current_bytes\":%zu,\"peak_bytes\":%zu,\"bins\":[", a, arena->alloc_count, arena->free_count, arena->current_bytes, arena->peak_bytes);
         for (unsigned b = 0; b < arena->n_bins; ++b) {
             bin_t* bin = &arena->bins[b];
@@ -143,6 +145,7 @@ void lmalloc_stats_export_json(const char* filename) {
         }
         fprintf(f, "]}");
         if (a + 1 < n_arenas) fprintf(f, ",\n");
+        malloc_mutex_unlock(TSDN_NULL, &arena->mutex);
     }
     fprintf(f, "\n  ],\n  \"pac\": {\"alloc_count\":%zu,\"free_count\":%zu,\"current_bytes\":%zu,\"peak_bytes\":%zu}\n}\n",
         atomic_fetch_add(&(g_pac_stats.alloc_count), 0),
@@ -275,22 +278,14 @@ void lmalloc_slab_stats_print(void) {
 }
 
 static char last_heap_dump_file[256] = {0};
+static volatile sig_atomic_t g_heap_dump_pending = 0;
 
-// heap dump信号处理器
+// heap dump信号处理器：只置标志。
+// fopen/printf/内存分配均非异步信号安全，若在处理器内执行可能
+// 打断临界区导致死锁或堆损坏；实际导出在分配路径的安全上下文执行。
 static void sigusr2_handler(int signo) {
     (void)signo;
-    char fname[256];
-    snprintf(fname, sizeof(fname), "heapdump_%ld.json", time(NULL));
-    lmalloc_stats_export_json(fname);
-    lmalloc_heap_dump();
-    printf("[signal] Heap dump导出到%s\n", fname);
-    snprintf(last_heap_dump_file, sizeof(last_heap_dump_file), "%s", fname);
-#ifdef LMALLOC_PROFILE
-    char pfname[256];
-    snprintf(pfname, sizeof(pfname), "profile_%ld.json", time(NULL));
-    lmalloc_profile_export_json(pfname);
-    printf("[signal] Profile导出到%s\n", pfname);
-#endif
+    g_heap_dump_pending = 1;
 }
 
 // 注册信号处理器
@@ -300,11 +295,36 @@ void lmalloc_debug_signal_init(void) {
     sigaction(SIGUSR2, &sa, NULL);
 }
 
+// 在安全上下文（分配路径）轮询信号请求并执行堆dump
+void lmalloc_debug_signal_poll(void) {
+    if (!g_heap_dump_pending)
+        return;
+    g_heap_dump_pending = 0;
+    char fname[256];
+    snprintf(fname, sizeof(fname), "heapdump_%ld.json", (long)time(NULL));
+    lmalloc_stats_export_json(fname);
+    lmalloc_heap_dump();
+    printf("[signal] Heap dump导出到%s\n", fname);
+    snprintf(last_heap_dump_file, sizeof(last_heap_dump_file), "%s", fname);
+#ifdef LMALLOC_PROFILE
+    char pfname[256];
+    snprintf(pfname, sizeof(pfname), "profile_%ld.json", (long)time(NULL));
+    lmalloc_profile_export_json(pfname);
+    printf("[signal] Profile导出到%s\n", pfname);
+#endif
+}
+
 // heap snapshot diff（简化版：比较两次heap dump文件大小）
 void lmalloc_heap_snapshot_diff(const char* file1, const char* file2) {
     FILE* f1 = fopen(file1, "r");
     FILE* f2 = fopen(file2, "r");
-    if (!f1 || !f2) { printf("[diff] 打开文件失败\n"); return; }
+    if (!f1 || !f2) {
+        // 关闭已成功打开的文件，避免泄漏
+        if (f1) fclose(f1);
+        if (f2) fclose(f2);
+        printf("[diff] 打开文件失败\n");
+        return;
+    }
     fseek(f1, 0, SEEK_END); long sz1 = ftell(f1); rewind(f1);
     fseek(f2, 0, SEEK_END); long sz2 = ftell(f2); rewind(f2);
     printf("[diff] %s: %ld bytes, %s: %ld bytes, diff: %+ld bytes\n", file1, sz1, file2, sz2, sz2-sz1);
