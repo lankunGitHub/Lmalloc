@@ -27,6 +27,7 @@
  *   - 简化实现，便于集成和扩展
  */
 #include "lmalloc_leak.h"
+#include "lmalloc_json.h"
 #include <stdio.h>
 #include <string.h>
 #include <pthread.h>
@@ -54,6 +55,7 @@ typedef struct leak_entry_s {
 
 static leak_entry_t leak_table[LEAK_MAX_OBJS];
 static size_t leak_count = 0;
+static size_t leak_dropped = 0; // 表满被丢弃的注册数（用于报告提示漏报）
 static pthread_mutex_t leak_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /**
@@ -79,6 +81,8 @@ void leak_register(void* ptr, size_t size, const char* tag, uint32_t tid) {
         e->tag = tag;
         e->thread_id = tid;
         e->callstack_depth = 0; // 可选采样
+    } else {
+        ++leak_dropped; // 表满丢弃：报告时提示存在漏报
     }
     pthread_mutex_unlock(&leak_mutex);
 }
@@ -105,6 +109,44 @@ void leak_unregister(void* ptr) {
 }
 
 /**
+ * @brief 从指定偏移扫描leak_table（内部实现，支持分批导出）
+ *
+ * 线程安全：多线程安全，互斥锁保护
+ *
+ * @param buf 输出泄漏对象数组
+ * @param max 最大扫描数
+ * @param min_age_sec 最小存活时间（秒）
+ * @param pos 输入输出参数：扫描起始下标，返回已推进到的下标
+ * @return 实际发现的泄漏对象数
+ */
+static size_t leak_scan_from(lmalloc_leak_info_t* buf, size_t max,
+                             time_t min_age_sec, size_t* pos) {
+    if (!g_leak_enabled) return 0;
+    pthread_mutex_lock(&leak_mutex);
+    time_t now = time(NULL);
+    size_t n = 0;
+    size_t i = *pos;
+    for (; i < leak_count && n < max; ++i) {
+        if (now - leak_table[i].alloc_time >= min_age_sec) {
+            buf[n].ptr = leak_table[i].ptr;
+            buf[n].size = leak_table[i].size;
+            buf[n].alloc_time = leak_table[i].alloc_time;
+            buf[n].tag = leak_table[i].tag;
+            buf[n].thread_id = leak_table[i].thread_id;
+            // 钳制调用栈深度，防止异常数据导致越界拷贝
+            buf[n].callstack_depth =
+                leak_table[i].callstack_depth > 8 ? 8 : leak_table[i].callstack_depth;
+            memcpy(buf[n].callstack, leak_table[i].callstack,
+                   sizeof(void*) * buf[n].callstack_depth);
+            n++;
+        }
+    }
+    *pos = i;
+    pthread_mutex_unlock(&leak_mutex);
+    return n;
+}
+
+/**
  * @brief 扫描所有活跃分配，返回可疑泄漏对象数
  * @param buf 输出泄漏对象数组
  * @param max 最大扫描数
@@ -112,30 +154,10 @@ void leak_unregister(void* ptr) {
  * @return 实际发现的泄漏对象数
  *
  * 线程安全：多线程安全，互斥锁保护
- *
- * 算法说明：
- *   - 支持最小存活时间筛选
- *   - 拷贝leak_table到buf
  */
 size_t lmalloc_leak_scan(lmalloc_leak_info_t* buf, size_t max, time_t min_age_sec) {
-    if (!g_leak_enabled) return 0;
-    pthread_mutex_lock(&leak_mutex);
-    time_t now = time(NULL);
-    size_t n = 0;
-    for (size_t i = 0; i < leak_count && n < max; ++i) {
-        if (now - leak_table[i].alloc_time >= min_age_sec) {
-            buf[n].ptr = leak_table[i].ptr;
-            buf[n].size = leak_table[i].size;
-            buf[n].alloc_time = leak_table[i].alloc_time;
-            buf[n].tag = leak_table[i].tag;
-            buf[n].thread_id = leak_table[i].thread_id;
-            buf[n].callstack_depth = leak_table[i].callstack_depth;
-            memcpy(buf[n].callstack, leak_table[i].callstack, sizeof(void*) * buf[n].callstack_depth);
-            n++;
-        }
-    }
-    pthread_mutex_unlock(&leak_mutex);
-    return n;
+    size_t pos = 0;
+    return leak_scan_from(buf, max, min_age_sec, &pos);
 }
 
 /**
@@ -147,11 +169,24 @@ size_t lmalloc_leak_scan(lmalloc_leak_info_t* buf, size_t max, time_t min_age_se
  */
 void lmalloc_leak_report_print(time_t min_age_sec) {
     if (!g_leak_enabled) return;
-    lmalloc_leak_info_t buf[LEAK_MAX_OBJS];
-    size_t n = lmalloc_leak_scan(buf, LEAK_MAX_OBJS, min_age_sec);
+    // 分批扫描：曾一次性在栈上放LEAK_MAX_OBJS(8192)条≈896KB，
+    // 小栈线程调用直接栈溢出
+    lmalloc_leak_info_t buf[256];
+    size_t pos = 0;
     printf("[lmalloc leak report] (min_age=%lds)\n", (long)min_age_sec);
-    for (size_t i = 0; i < n; ++i) {
-        printf("leak: ptr=%p size=%zu tag=%s alloc_time=%ld tid=%u\n", buf[i].ptr, buf[i].size, buf[i].tag ? buf[i].tag : "", (long)buf[i].alloc_time, buf[i].thread_id);
+    for (;;) {
+        size_t n = leak_scan_from(buf, 256, min_age_sec, &pos);
+        for (size_t i = 0; i < n; ++i) {
+            printf("leak: ptr=%p size=%zu tag=%s alloc_time=%ld tid=%u\n",
+                   buf[i].ptr, buf[i].size, buf[i].tag ? buf[i].tag : "",
+                   (long)buf[i].alloc_time, buf[i].thread_id);
+        }
+        if (n < 256)
+            break;
+    }
+    if (leak_dropped) {
+        printf("[lmalloc leak report] 注意：活跃对象超过表容量，已有%zu次注册被丢弃，报告可能漏报\n",
+               leak_dropped);
     }
 }
 
@@ -165,15 +200,26 @@ void lmalloc_leak_report_print(time_t min_age_sec) {
  */
 void lmalloc_leak_report_export(const char* filename, time_t min_age_sec) {
     if (!g_leak_enabled) return;
-    lmalloc_leak_info_t buf[LEAK_MAX_OBJS];
-    size_t n = lmalloc_leak_scan(buf, LEAK_MAX_OBJS, min_age_sec);
     FILE* f = fopen(filename, "w");
     if (!f) return;
+    // 分批扫描，避免大栈帧（曾8192条≈896KB压爆小栈线程）
+    lmalloc_leak_info_t buf[256];
+    size_t pos = 0;
+    int first = 1;
     fprintf(f, "[\n");
-    for (size_t i = 0; i < n; ++i) {
-        fprintf(f, "  {\"ptr\":%p,\"size\":%zu,\"tag\":\"%s\",\"alloc_time\":%ld,\"thread_id\":%u}%s\n",
-            buf[i].ptr, buf[i].size, buf[i].tag ? buf[i].tag : "", (long)buf[i].alloc_time, buf[i].thread_id, (i+1==n)?"":" ,");
+    for (;;) {
+        size_t n = leak_scan_from(buf, 256, min_age_sec, &pos);
+        for (size_t i = 0; i < n; ++i) {
+            if (!first)
+                fprintf(f, ",\n");
+            first = 0;
+            fprintf(f, "  {\"ptr\":\"%p\",\"size\":%zu,\"tag\":\"", buf[i].ptr, buf[i].size);
+            lmalloc_json_escape(f, buf[i].tag ? buf[i].tag : "");
+            fprintf(f, "\",\"alloc_time\":%ld,\"thread_id\":%u}", (long)buf[i].alloc_time, buf[i].thread_id);
+        }
+        if (n < 256)
+            break;
     }
-    fprintf(f, "]\n");
+    fprintf(f, "\n]\n");
     fclose(f);
-} 
+}
