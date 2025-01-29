@@ -36,6 +36,11 @@ void lmalloc_tag_stats_print(void);
 // 导出所有标签统计到文件（文本/JSON）
 void lmalloc_tag_stats_export(const char* filename);
 
+// 内部记账接口：主分配路径（lmalloc_tagged/lfree）的标签统计。
+// tag为NULL或未开启标签功能时为空操作。
+void lmalloc_tag_account_alloc(const char* tag, size_t size);
+void lmalloc_tag_account_free(const char* tag, size_t size);
+
 #ifdef __cplusplus
 }
 #endif

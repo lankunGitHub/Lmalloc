@@ -28,6 +28,7 @@
  *   - 支持多种导出/分析方式，便于集成和扩展
  */
 #include "lmalloc_profile.h"
+#include "lmalloc_json.h"
 #include <string.h>
 #include <stdio.h>
 #include <pthread.h>
@@ -58,6 +59,8 @@ void lmalloc_profile_export_filtered_json(const char* filename, const char* tag,
     fprintf(f, "[\n");
     size_t n = lmalloc_profile_events_count();
     lmalloc_profile_entry_t* buf = malloc(n * sizeof(lmalloc_profile_entry_t));
+    if (!buf)
+        return; // 分配失败直接放弃导出（曾对NULL解引用崩溃）
     n = lmalloc_profile_events_copy(buf, n);
     int first = 1;
     for (size_t i = 0; i < n; ++i) {
@@ -70,10 +73,13 @@ void lmalloc_profile_export_filtered_json(const char* filename, const char* tag,
         if (end_time && e->timestamp > end_time) continue;
         if (!first) fprintf(f, ",\n");
         first = 0;
-        fprintf(f, "  {\"ptr\":\"%p\",\"size\":%zu,\"is_alloc\":%u,\"thread_id\":%u,\"timestamp\":%ld,\"tag\":\"%s\",\"callstack\":[",
-            e->ptr, e->size, e->is_alloc, e->thread_id, (long)e->timestamp, e->tag ? e->tag : "");
-        for (int j = 0; j < e->callstack_depth; ++j) {
-            fprintf(f, "\"%p\"%s", e->callstack[j], (j+1==e->callstack_depth)?"":", ");
+        fprintf(f, "  {\"ptr\":\"%p\",\"size\":%zu,\"is_alloc\":%u,\"thread_id\":%u,\"timestamp\":%ld,\"tag\":\"",
+            e->ptr, e->size, e->is_alloc, e->thread_id, (long)e->timestamp);
+        lmalloc_json_escape(f, e->tag ? e->tag : "");
+        fprintf(f, "\",\"callstack\":[");
+        int depth = e->callstack_depth > 8 ? 8 : e->callstack_depth;
+        for (int j = 0; j < depth; ++j) {
+            fprintf(f, "\"%p\"%s", e->callstack[j], (j+1==depth)?"":", ");
         }
         fprintf(f, "]}");
     }
@@ -136,6 +142,8 @@ typedef struct {
 int lmalloc_profile_topN_tags(tag_stat_t* out, size_t maxN) {
     if (!g_profile_enabled) return 0;
     lmalloc_profile_entry_t* buf = malloc(PROFILE_RING_SIZE * sizeof(lmalloc_profile_entry_t));
+    if (!buf)
+        return 0;
     size_t n = lmalloc_profile_events_copy(buf, PROFILE_RING_SIZE);
     size_t n_tags = 0;
     for (size_t i = 0; i < n; ++i) {
@@ -177,6 +185,8 @@ typedef struct {
 int lmalloc_profile_topN_threads(thread_stat_t* out, size_t maxN) {
     if (!g_profile_enabled) return 0;
     lmalloc_profile_entry_t* buf = malloc(PROFILE_RING_SIZE * sizeof(lmalloc_profile_entry_t));
+    if (!buf)
+        return 0;
     size_t n = lmalloc_profile_events_copy(buf, PROFILE_RING_SIZE);
     size_t n_threads = 0;
     for (size_t i = 0; i < n; ++i) {
@@ -216,8 +226,10 @@ void lmalloc_profile_export(const char* filename) {
     fprintf(f, "[\n");
     for (size_t i = 0; i < profile_count; ++i) {
         lmalloc_profile_entry_t* e = &profile_ring[(profile_head + PROFILE_RING_SIZE - profile_count + i) % PROFILE_RING_SIZE];
-        fprintf(f, "  {\"ptr\":%p,\"size\":%zu,\"is_alloc\":%u,\"thread_id\":%u,\"timestamp\":%ld,\"tag\":\"%s\"}%s\n",
-            e->ptr, e->size, e->is_alloc, e->thread_id, (long)e->timestamp, e->tag ? e->tag : "", (i+1==profile_count)?"":" ,");
+        fprintf(f, "  {\"ptr\":\"%p\",\"size\":%zu,\"is_alloc\":%u,\"thread_id\":%u,\"timestamp\":%ld,\"tag\":\"",
+            e->ptr, e->size, e->is_alloc, e->thread_id, (long)e->timestamp);
+        lmalloc_json_escape(f, e->tag ? e->tag : "");
+        fprintf(f, "\"}%s\n", (i+1==profile_count)?"":" ,");
     }
     fprintf(f, "]\n");
     fclose(f);
@@ -231,11 +243,13 @@ void lmalloc_profile_export_csv(const char* filename) {
     fprintf(f, "ptr,size,is_alloc,thread_id,timestamp,tag,callstack\n");
     size_t n = lmalloc_profile_events_count();
     lmalloc_profile_entry_t* buf = malloc(n * sizeof(lmalloc_profile_entry_t));
+    if (!buf) { fclose(f); return; }
     n = lmalloc_profile_events_copy(buf, n);
     for (size_t i = 0; i < n; ++i) {
         fprintf(f, "%p,%zu,%u,%u,%ld,%s,\"", buf[i].ptr, buf[i].size, buf[i].is_alloc, buf[i].thread_id, (long)buf[i].timestamp, buf[i].tag ? buf[i].tag : "");
-        for (int j = 0; j < buf[i].callstack_depth; ++j) {
-            fprintf(f, "%p%s", buf[i].callstack[j], (j+1==buf[i].callstack_depth)?"":";");
+        int depth = buf[i].callstack_depth > 8 ? 8 : buf[i].callstack_depth;
+        for (int j = 0; j < depth; ++j) {
+            fprintf(f, "%p%s", buf[i].callstack[j], (j+1==depth)?"":";");
         }
         fprintf(f, "\"\n");
     }
@@ -250,12 +264,16 @@ void lmalloc_profile_export_json(const char* filename) {
     fprintf(f, "[\n");
     size_t n = lmalloc_profile_events_count();
     lmalloc_profile_entry_t* buf = malloc(n * sizeof(lmalloc_profile_entry_t));
+    if (!buf) { fclose(f); return; }
     n = lmalloc_profile_events_copy(buf, n);
     for (size_t i = 0; i < n; ++i) {
-        fprintf(f, "  {\"ptr\":\"%p\",\"size\":%zu,\"is_alloc\":%u,\"thread_id\":%u,\"timestamp\":%ld,\"tag\":\"%s\",\"callstack\":[",
-            buf[i].ptr, buf[i].size, buf[i].is_alloc, buf[i].thread_id, (long)buf[i].timestamp, buf[i].tag ? buf[i].tag : "");
-        for (int j = 0; j < buf[i].callstack_depth; ++j) {
-            fprintf(f, "\"%p\"%s", buf[i].callstack[j], (j+1==buf[i].callstack_depth)?"":", ");
+        fprintf(f, "  {\"ptr\":\"%p\",\"size\":%zu,\"is_alloc\":%u,\"thread_id\":%u,\"timestamp\":%ld,\"tag\":\"",
+            buf[i].ptr, buf[i].size, buf[i].is_alloc, buf[i].thread_id, (long)buf[i].timestamp);
+        lmalloc_json_escape(f, buf[i].tag ? buf[i].tag : "");
+        fprintf(f, "\",\"callstack\":[");
+        int depth = buf[i].callstack_depth > 8 ? 8 : buf[i].callstack_depth;
+        for (int j = 0; j < depth; ++j) {
+            fprintf(f, "\"%p\"%s", buf[i].callstack[j], (j+1==depth)?"":", ");
         }
         fprintf(f, "]}%s\n", (i+1==n)?"":" ,");
     }
