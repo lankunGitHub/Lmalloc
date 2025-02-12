@@ -90,14 +90,16 @@ void* lmemalign(size_t alignment, size_t size);
 按 `alignment`（2 的幂）字节对齐分配 `size` 字节内存，类似 `posix_memalign`。
 大块（> 1MB）或高对齐（> 4096）请求直接走 pac/mmap 路径。
 
-### lmalloc_tag / lfree_tag
+### lmalloc_tag / lmalloc_tagged / lfree_tag
 
 ```c
 void* lmalloc_tag(size_t size, const char* tag);
+void* lmalloc_tagged(size_t size, const char* tag);
 void lfree_tag(void* ptr);
 ```
 
-带标签分配/释放，便于分组统计、热点分析与内存归因。标签统计需先
+带标签分配/释放，便于分组统计、热点分析与内存归因。`lmalloc_tagged`
+与 `lmalloc_tag` 等价（命名与文档一致）。标签统计需先
 `lmalloc_enable_tag(true)`。
 
 ## 统计与监控 API

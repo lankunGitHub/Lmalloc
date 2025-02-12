@@ -1,5 +1,6 @@
-# 编译产物
+# 编译产物（含-MMD生成的依赖文件）
 *.o
+*.d
 *.a
 *.so
 *.so.*
@@ -8,6 +9,7 @@
 tests/test_main
 tests/check
 tests/signal_test
+tests/stress_mt
 
 # 运行时导出的统计/调试文件
 *.csv

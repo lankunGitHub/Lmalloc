@@ -13,7 +13,8 @@ SHARED_LIB := libmemory.so
 
 # 编译器和参数
 CC ?= gcc
-CFLAGS := -O2 -Wall -Wextra -I$(INC_DIR) -fPIC
+# -MMD -MP 生成头文件依赖，避免头文件修改后 .o 不重建导致新旧代码混编
+CFLAGS := -O2 -Wall -Wextra -I$(INC_DIR) -fPIC -MMD -MP
 AR := ar
 ARFLAGS := rcs
 
@@ -47,9 +48,12 @@ $(SHARED_LIB): $(OBJS)
 $(SRC_DIR)/%.o: $(SRC_DIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# 引入头文件依赖（.d 文件由 -MMD -MP 自动生成）
+-include $(OBJS:.o=.d)
+
 # 清理目标
 clean:
-	rm -f $(SRC_DIR)/*.o $(STATIC_LIB) $(SHARED_LIB) $(TEST_BINS)
+	rm -f $(SRC_DIR)/*.o $(SRC_DIR)/*.d $(STATIC_LIB) $(SHARED_LIB) $(TEST_BINS)
 
 # 编译并运行测试
 test: all $(TEST_BINS)
@@ -63,20 +67,21 @@ tests/test_main: tests/test_main.c $(STATIC_LIB)
 tests/check: tests/check.c $(STATIC_LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(STATIC_LIB) -lpthread
 
-# 安装库和头文件
+# 安装库和头文件（只安装公开头文件 memory/lmalloc.h，
+# 内部头文件不属于公共API；曾误装到 memory/memory/ 嵌套目录导致
+# #include <memory/lmalloc.h> 找不到）
 install: all
 	install -d $(LIB_INSTALL_DIR)
 	install -m 644 $(STATIC_LIB) $(LIB_INSTALL_DIR)/
 	install -m 755 $(SHARED_LIB) $(LIB_INSTALL_DIR)/
 	install -d $(INCLUDE_INSTALL_DIR)
-	install -m 644 $(INC_DIR)/*.h $(INCLUDE_INSTALL_DIR)/
-	install -d $(INCLUDE_INSTALL_DIR)/memory
-	install -m 644 $(INC_DIR)/memory/*.h $(INCLUDE_INSTALL_DIR)/memory/
+	install -m 644 $(INC_DIR)/memory/lmalloc.h $(INCLUDE_INSTALL_DIR)/
 
 # 卸载
 uninstall:
 	rm -f $(LIB_INSTALL_DIR)/$(STATIC_LIB) $(LIB_INSTALL_DIR)/$(SHARED_LIB)
-	rm -rf $(INCLUDE_INSTALL_DIR)
+	rm -f $(INCLUDE_INSTALL_DIR)/lmalloc.h
+	rmdir --ignore-fail-on-non-empty $(INCLUDE_INSTALL_DIR) 2>/dev/null || true
 
 # 用法说明
 # make static   # 生成静态库 libmemory.a
